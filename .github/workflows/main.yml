@@ -17,9 +17,6 @@ jobs:
       - name: Show Xcode version
         run: xcodebuild -version
 
-      - name: List project files
-        run: find . -maxdepth 3 -type f | sort
-
       - name: Build Athletica
         run: |
           xcodebuild \
@@ -27,7 +24,6 @@ jobs:
             -scheme Athletica \
             -configuration Release \
             -sdk iphoneos \
-            -destination 'generic/platform=iOS' \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             build
