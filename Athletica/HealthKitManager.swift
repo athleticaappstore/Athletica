@@ -6,17 +6,20 @@ final class HealthKitManager: ObservableObject {
 
     @Published var steps: Int = 0
     @Published var activeCalories: Double = 0
+    @Published var authorized: Bool = false
 
     private let healthStore = HKHealthStore()
 
-    func requestAuthorization() async {
+    func requestAccess() async {
         guard HKHealthStore.isHealthDataAvailable() else {
             return
         }
 
         guard
             let stepType = HKObjectType.quantityType(forIdentifier: .stepCount),
-            let calorieType = HKObjectType.quantityType(forIdentifier: .activeEnergyBurned)
+            let calorieType = HKObjectType.quantityType(
+                forIdentifier: .activeEnergyBurned
+            )
         else {
             return
         }
@@ -27,10 +30,22 @@ final class HealthKitManager: ObservableObject {
                 read: [stepType, calorieType]
             )
 
+            await MainActor.run {
+                self.authorized = true
+            }
+
             await refresh()
         } catch {
+            await MainActor.run {
+                self.authorized = false
+            }
+
             print("HealthKit authorization failed: \(error)")
         }
+    }
+
+    func requestAuthorization() async {
+        await requestAccess()
     }
 
     func refresh() async {
