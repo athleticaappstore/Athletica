@@ -1,141 +1,112 @@
 import Foundation
-import StoreKit
+import HealthKit
+import Combine
 
-@MainActor
-final class SubscriptionManager: ObservableObject {
+final class HealthKitManager: ObservableObject {
 
-    static let monthlyID = "com.example.athletica.premium.monthly"
-    static let yearlyID = "com.example.athletica.premium.yearly"
+    @Published var steps: Int = 0
+    @Published var activeCalories: Double = 0
 
-    static let productIDs = [
-        monthlyID,
-        yearlyID
-    ]
+    private let healthStore = HKHealthStore()
 
-    @Published private(set) var products: [Product] = []
-    @Published private(set) var isPremium = false
-    @Published var isLoading = false
-    @Published var message: String?
-
-    private var updatesTask: Task<Void, Never>?
-
-    init() {
-        updatesTask = Task { [weak self] in
-            guard let self else { return }
-
-            for await result in Transaction.updates {
-                await self.handle(result)
-            }
-        }
-
-        Task {
-            await load()
-        }
-    }
-
-    deinit {
-        updatesTask?.cancel()
-    }
-
-    func load() async {
-        isLoading = true
-        defer {
-            isLoading = false
-        }
-
-        do {
-            products = try await Product.products(for: Self.productIDs)
-                .sorted { $0.price < $1.price }
-
-            await refreshEntitlement()
-        } catch {
-            message = "Products could not be loaded. Check your App Store Connect product setup."
-        }
-    }
-
-    func purchase(_ product: Product) async {
-        isLoading = true
-        defer {
-            isLoading = false
-        }
-
-        do {
-            let result = try await product.purchase()
-
-            switch result {
-            case .success(let verification):
-                await handle(verification)
-
-            case .userCancelled:
-                break
-
-            case .pending:
-                message = "Your purchase is pending approval."
-
-            @unknown default:
-                break
-            }
-        } catch {
-            message = error.localizedDescription
-        }
-    }
-
-    func restore() async {
-        isLoading = true
-
-        defer {
-            isLoading = false
-        }
-
-        do {
-            try await StoreKit.AppStore.sync()
-            await refreshEntitlement()
-
-            message = isPremium
-                ? "Your Premium access has been restored."
-                : "No active Premium subscription was found."
-        } catch {
-            message = error.localizedDescription
-        }
-    }
-
-    private func handle(
-        _ result: VerificationResult<Transaction>
-    ) async {
-        guard case .verified(let transaction) = result else {
+    func requestAuthorization() async {
+        guard HKHealthStore.isHealthDataAvailable() else {
             return
         }
 
-        if Self.productIDs.contains(transaction.productID) {
-            isPremium =
-                transaction.revocationDate == nil &&
-                (transaction.expirationDate == nil ||
-                 transaction.expirationDate! > Date())
+        guard
+            let stepType = HKObjectType.quantityType(forIdentifier: .stepCount),
+            let calorieType = HKObjectType.quantityType(forIdentifier: .activeEnergyBurned)
+        else {
+            return
         }
 
-        await transaction.finish()
+        do {
+            try await healthStore.requestAuthorization(
+                toShare: [],
+                read: [stepType, calorieType]
+            )
+
+            await refresh()
+        } catch {
+            print("HealthKit authorization failed: \(error)")
+        }
     }
 
-    private func refreshEntitlement() async {
-        var premium = false
+    func refresh() async {
+        guard HKHealthStore.isHealthDataAvailable() else {
+            return
+        }
 
-        for await result in Transaction.currentEntitlements {
-            guard case .verified(let transaction) = result else {
-                continue
-            }
+        let end = Date()
+        let start = Calendar.current.startOfDay(for: end)
 
-            if Self.productIDs.contains(transaction.productID) {
-                let active =
-                    transaction.revocationDate == nil &&
-                    (transaction.expirationDate == nil ||
-                     transaction.expirationDate! > Date())
+        if let stepType = HKObjectType.quantityType(
+            forIdentifier: .stepCount
+        ) {
+            let value = await sample(
+                stepType,
+                start: start,
+                end: end,
+                unit: .count()
+            )
 
-                if active {
-                    premium = true
-                }
+            await MainActor.run {
+                self.steps = Int(value)
             }
         }
 
-        isPremium = premium
+        if let calorieType = HKObjectType.quantityType(
+            forIdentifier: .activeEnergyBurned
+        ) {
+            let value = await sample(
+                calorieType,
+                start: start,
+                end: end,
+                unit: .kilocalorie()
+            )
+
+            await MainActor.run {
+                self.activeCalories = value
+            }
+        }
+    }
+
+    private func sample(
+        _ type: HKQuantityType,
+        start: Date,
+        end: Date,
+        unit: HKUnit
+    ) async -> Double {
+
+        await withCheckedContinuation { continuation in
+
+            let predicate = HKQuery.predicateForSamples(
+                withStart: start,
+                end: end,
+                options: .strictStartDate
+            )
+
+            let query = HKStatisticsQuery(
+                quantityType: type,
+                quantitySamplePredicate: predicate,
+                options: .cumulativeSum
+            ) { _, statistics, error in
+
+                if let error = error {
+                    print("HealthKit query failed: \(error)")
+                    continuation.resume(returning: 0)
+                    return
+                }
+
+                let value = statistics?
+                    .sumQuantity()?
+                    .doubleValue(for: unit) ?? 0
+
+                continuation.resume(returning: value)
+            }
+
+            self.healthStore.execute(query)
+        }
     }
 }
