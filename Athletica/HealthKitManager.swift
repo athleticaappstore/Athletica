@@ -1,29 +1,141 @@
 import Foundation
-import HealthKit
+import StoreKit
 
-@MainActor final class HealthKitManager: ObservableObject {
-    @Published var authorized=false
-    @Published var steps=0
-    @Published var activeCalories=0
-    private let store=HKHealthStore()
-    var available:Bool { HKHealthStore.isHealthDataAvailable() }
-    func requestAccess() async {
-        guard available else { return }
-        let read:Set<HKObjectType>=[HKObjectType.quantityType(forIdentifier:.stepCount)!,HKObjectType.quantityType(forIdentifier:.activeEnergyBurned)!]
-        do { try await store.requestAuthorization(toShare: [], read: read); authorized=true; await refresh() } catch { authorized=false }
-    }
-    func refresh() async {
-        guard available else{return}
-        let start=Calendar.current.startOfDay(for:.now); let end=Date()
-        if let t=HKObjectType.quantityType(forIdentifier:.stepCount), let q=try? await sample(t,start,end,unit: .count()){steps=Int(q)}
-        if let t=HKObjectType.quantityType(forIdentifier:.activeEnergyBurned), let q=try? await sample(t,start,end,unit: .kilocalorie()){activeCalories=Int(q)}
-    }
-    private func sample(_ type:HKQuantityType,start:Date,end:Date,unit:HKUnit) async throws -> Double {
-        try await withCheckedThrowingContinuation { cont in
-            let pred=HKQuery.predicateForSamples(withStart:start,end:end,options:.strictStartDate)
-            let q=HKStatisticsQuery(quantityType:type,quantitySamplePredicate:pred,options:.cumulativeSum){_,stats,error in
-                if let error {cont.resume(throwing:error);return};cont.resume(returning:stats?.sumQuantity()?.doubleValue(for: unit) ?? 0)
-            };store.execute(q)
+@MainActor
+final class SubscriptionManager: ObservableObject {
+
+    static let monthlyID = "com.example.athletica.premium.monthly"
+    static let yearlyID = "com.example.athletica.premium.yearly"
+
+    static let productIDs = [
+        monthlyID,
+        yearlyID
+    ]
+
+    @Published private(set) var products: [Product] = []
+    @Published private(set) var isPremium = false
+    @Published var isLoading = false
+    @Published var message: String?
+
+    private var updatesTask: Task<Void, Never>?
+
+    init() {
+        updatesTask = Task { [weak self] in
+            guard let self else { return }
+
+            for await result in Transaction.updates {
+                await self.handle(result)
+            }
         }
+
+        Task {
+            await load()
+        }
+    }
+
+    deinit {
+        updatesTask?.cancel()
+    }
+
+    func load() async {
+        isLoading = true
+        defer {
+            isLoading = false
+        }
+
+        do {
+            products = try await Product.products(for: Self.productIDs)
+                .sorted { $0.price < $1.price }
+
+            await refreshEntitlement()
+        } catch {
+            message = "Products could not be loaded. Check your App Store Connect product setup."
+        }
+    }
+
+    func purchase(_ product: Product) async {
+        isLoading = true
+        defer {
+            isLoading = false
+        }
+
+        do {
+            let result = try await product.purchase()
+
+            switch result {
+            case .success(let verification):
+                await handle(verification)
+
+            case .userCancelled:
+                break
+
+            case .pending:
+                message = "Your purchase is pending approval."
+
+            @unknown default:
+                break
+            }
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    func restore() async {
+        isLoading = true
+
+        defer {
+            isLoading = false
+        }
+
+        do {
+            try await StoreKit.AppStore.sync()
+            await refreshEntitlement()
+
+            message = isPremium
+                ? "Your Premium access has been restored."
+                : "No active Premium subscription was found."
+        } catch {
+            message = error.localizedDescription
+        }
+    }
+
+    private func handle(
+        _ result: VerificationResult<Transaction>
+    ) async {
+        guard case .verified(let transaction) = result else {
+            return
+        }
+
+        if Self.productIDs.contains(transaction.productID) {
+            isPremium =
+                transaction.revocationDate == nil &&
+                (transaction.expirationDate == nil ||
+                 transaction.expirationDate! > Date())
+        }
+
+        await transaction.finish()
+    }
+
+    private func refreshEntitlement() async {
+        var premium = false
+
+        for await result in Transaction.currentEntitlements {
+            guard case .verified(let transaction) = result else {
+                continue
+            }
+
+            if Self.productIDs.contains(transaction.productID) {
+                let active =
+                    transaction.revocationDate == nil &&
+                    (transaction.expirationDate == nil ||
+                     transaction.expirationDate! > Date())
+
+                if active {
+                    premium = true
+                }
+            }
+        }
+
+        isPremium = premium
     }
 }
